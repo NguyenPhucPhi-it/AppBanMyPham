@@ -37,6 +37,10 @@
         <activity android:name=".ui.admin.ManageProductActivity" />
         <activity android:name=".ui.admin.ManageBrandActivity" />
         <activity android:name=".ui.cart.CartActivity"/>
+        <activity
+            android:name=".ui.product.ProductDetailsActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.product.ProductActivity" />
     </application>
 
 </manifest>

@@ -23,22 +23,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import com.example.appbanmypham.data.local.AppDatabase
+import com.example.appbanmypham.model.Product          // ← import từ model package
+import com.example.appbanmypham.ui.auth.LoginActivity
 import com.example.appbanmypham.ui.cart.CartActivity
 import com.example.appbanmypham.ui.theme.*
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import com.google.firebase.firestore.ListenerRegistration  // ← cần import thêm
 
 class ProductActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -48,10 +47,12 @@ class ProductActivity : ComponentActivity() {
             AppBanMyPhamTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = BackgroundPrimary) {
                     ProductScreen(
-                        onGoCart = { startActivity(Intent(this, CartActivity::class.java)) },
-                        onLogout = {
-                            FirebaseAuth.getInstance().signOut()
-                            finish()
+                        onGoCart   = { startActivity(Intent(this, CartActivity::class.java)) },
+                        onGoLogin  = { startActivity(Intent(this, LoginActivity::class.java)) },
+                        onGoDetail = { product ->
+                            val intent = Intent(this, ProductDetailsActivity::class.java)
+                            intent.putExtra("product_id", product.id)
+                            startActivity(intent)
                         }
                     )
                 }
@@ -60,32 +61,49 @@ class ProductActivity : ComponentActivity() {
     }
 }
 
-// ── Data class ────────────────────────────────────────────────────────────────
-data class ProductDisplay(
-    val id: String = "",
-    val name: String = "",
-    val price: Double = 0.0,
-    val originalPrice: Double = 0.0,
-    val stock: Int = 0,
-    val description: String = "",
-    val brandName: String = "",
-    val imageUrl: String = "",
-    val category: String = "",
-    val isNew: Boolean = false
-)
+// ── Bottom Nav Tab ─────────────────────────────────────────────────────────────
+enum class BottomTab { HOME, ORDERS, ACCOUNT }
 
 // ── Screen ────────────────────────────────────────────────────────────────────
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProductScreen(
-    onGoCart: () -> Unit = {},
-    onLogout: () -> Unit = {}
+    onGoCart   : () -> Unit = {},
+    onGoLogin  : () -> Unit = {},
+    onGoDetail : (Product) -> Unit = {}
 ) {
-    val context = LocalContext.current
-    val db = remember { FirebaseFirestore.getInstance() }
+    val db   = remember { FirebaseFirestore.getInstance() }
     val auth = remember { FirebaseAuth.getInstance() }
 
-    var products    by remember { mutableStateOf(listOf<ProductDisplay>()) }
+    var currentUser by remember { mutableStateOf(auth.currentUser) }
+    var userRole    by remember { mutableStateOf<String?>(null) }
+
+    // ── Lắng nghe Auth state ──────────────────────────────────────────────────
+    DisposableEffect(Unit) {
+        val listener = FirebaseAuth.AuthStateListener { fa ->
+            currentUser = fa.currentUser
+            if (fa.currentUser == null) userRole = null
+        }
+        auth.addAuthStateListener(listener)
+        onDispose { auth.removeAuthStateListener(listener) }
+    }
+
+    // ── Lấy role của user ─────────────────────────────────────────────────────
+    LaunchedEffect(currentUser?.uid) {
+        val uid = currentUser?.uid ?: run { userRole = null; return@LaunchedEffect }
+        db.collection("users").document(uid).get()
+            .addOnSuccessListener { doc ->
+                userRole = when (doc.getLong("role")?.toInt()) {
+                    1    -> "admin"
+                    else -> "user"
+                }
+            }
+            .addOnFailureListener { userRole = "user" }
+    }
+
+    val isLoggedIn = currentUser != null
+
+    var products    by remember { mutableStateOf(listOf<Product>()) }
     var categories  by remember { mutableStateOf(listOf<String>()) }
     var isLoading   by remember { mutableStateOf(true) }
     var searchQuery by remember { mutableStateOf("") }
@@ -93,54 +111,156 @@ fun ProductScreen(
     var cartCount   by remember { mutableStateOf(0) }
     var isGridView  by remember { mutableStateOf(true) }
     var showSearch  by remember { mutableStateOf(false) }
+    var selectedTab by remember { mutableStateOf(BottomTab.HOME) }
 
-    // Load sản phẩm realtime từ Firestore + sync Room
-    LaunchedEffect(Unit) {
-        db.collection("products")
+    var showAccountDialog by remember { mutableStateOf(false) }
+    var showLogoutConfirm by remember { mutableStateOf(false) }
+
+    // ── FIX CHÍNH: Dùng DisposableEffect để remove listener khi Composable bị dispose ──
+    // Listener sản phẩm KHÔNG phụ thuộc vào auth — ai cũng đọc được
+    // (Firestore Rules phải cho phép: allow read: if true trên collection products)
+    DisposableEffect(Unit) {
+        var registration: ListenerRegistration? = null
+
+        registration = db.collection("products")
             .orderBy("createdAt", com.google.firebase.firestore.Query.Direction.DESCENDING)
-            .addSnapshotListener { snap, _ ->
-                val now = System.currentTimeMillis()
-                val list = snap?.documents?.map { doc ->
-                    val createdAt = doc.getLong("createdAt") ?: 0L
-                    ProductDisplay(
-                        id            = doc.id,
-                        name          = doc.getString("name") ?: "",
-                        price         = doc.getDouble("price") ?: 0.0,
-                        originalPrice = doc.getDouble("originalPrice") ?: 0.0,
-                        stock         = (doc.getLong("stock") ?: 0L).toInt(),
-                        description   = doc.getString("description") ?: "",
-                        brandName     = doc.getString("brandName") ?: "",
-                        imageUrl      = doc.getString("imageUrl") ?: "",
-                        category      = doc.getString("category") ?: "",
-                        isNew         = (now - createdAt) < 7 * 24 * 60 * 60 * 1000L
-                    )
+            .addSnapshotListener { snap, error ->
+                // Nếu lỗi (ví dụ mất mạng) thì giữ nguyên list cũ, không xóa
+                if (error != null) return@addSnapshotListener
+
+                val now  = System.currentTimeMillis()
+                val list = snap?.documents?.mapNotNull { doc ->
+                    // mapNotNull để bỏ qua document lỗi thay vì crash
+                    runCatching {
+                        Product(
+                            id          = doc.id,
+                            name        = doc.getString("name")        ?: "",
+                            price       = doc.getDouble("price")       ?: 0.0,
+                            stock       = (doc.getLong("stock")        ?: 0L).toInt(),
+                            description = doc.getString("description") ?: "",
+                            brandId     = doc.getString("brandId")     ?: "",
+                            brandName   = doc.getString("brandName")   ?: "",
+                            imageUrl    = doc.getString("imageUrl")    ?: "",
+                            category    = doc.getString("category")    ?: "",
+                            createdAt   = doc.getLong("createdAt")     ?: now
+                        )
+                    }.getOrNull()
                 } ?: emptyList()
-                products = list
-                categories = listOf("Tất cả") + list.map { it.category }.filter { it.isNotEmpty() }.distinct()
-                isLoading = false
+
+                products   = list
+                categories = listOf("Tất cả") +
+                        list.map { it.category }.filter { it.isNotEmpty() }.distinct()
+                isLoading  = false
             }
+
+        onDispose {
+            registration?.remove() // ← Quan trọng: remove listener khi rời màn hình
+        }
     }
 
-    // Lấy số lượng giỏ hàng
-    LaunchedEffect(auth.currentUser?.uid) {
-        val uid = auth.currentUser?.uid ?: return@LaunchedEffect
-        db.collection("carts").document(uid).collection("items")
+    // ── Lắng nghe giỏ hàng — chỉ khi đã đăng nhập ───────────────────────────
+    DisposableEffect(currentUser?.uid) {
+        val uid = currentUser?.uid ?: run {
+            cartCount = 0
+            return@DisposableEffect onDispose {}
+        }
+
+        val registration = db.collection("carts").document(uid).collection("items")
             .addSnapshotListener { snap, _ -> cartCount = snap?.size() ?: 0 }
+
+        onDispose { registration.remove() }
     }
 
+    // ── Filter sản phẩm ───────────────────────────────────────────────────────
     val filtered = products.filter { p ->
-        val matchCat = selectedCat == "Tất cả" || p.category == selectedCat
+        val matchCat    = selectedCat == "Tất cả" || p.category == selectedCat
         val matchSearch = searchQuery.isBlank() ||
                 p.name.contains(searchQuery, ignoreCase = true) ||
                 p.brandName.contains(searchQuery, ignoreCase = true)
-        matchCat && matchSearch && p.stock > 0
+        matchCat && matchSearch
     }
 
+    // ── Account Info Dialog ───────────────────────────────────────────────────
+    if (showAccountDialog && isLoggedIn) {
+        AlertDialog(
+            onDismissRequest = { showAccountDialog = false },
+            containerColor   = Color.White,
+            shape            = RoundedCornerShape(20.dp),
+            title = {
+                Text("Tài khoản", fontWeight = FontWeight.Bold, color = Color(0xFF1A4A40), fontSize = 18.sp)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(CircleShape)
+                            .background(brush = AppGradients.mintHorizontal)
+                            .align(Alignment.CenterHorizontally),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = (currentUser?.displayName?.firstOrNull()?.toString()
+                                ?: currentUser?.email?.firstOrNull()?.toString()
+                                ?: "U").uppercase(),
+                            color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    AccountInfoRow("Tên",   currentUser?.displayName ?: "Chưa cập nhật")
+                    AccountInfoRow("Email", currentUser?.email       ?: "Chưa cập nhật")
+                    AccountInfoRow("Role",  if (userRole == "admin") "Quản trị viên" else "Người dùng")
+                    HorizontalDivider(color = Color(0xFFEAF9F5))
+                    TextButton(
+                        onClick = { showAccountDialog = false; showLogoutConfirm = true },
+                        colors  = ButtonDefaults.textButtonColors(contentColor = Color(0xFFE57373))
+                    ) {
+                        Icon(Icons.Default.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Đăng xuất", fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAccountDialog = false }) {
+                    Text("Đóng", color = MintGreen, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        )
+    }
+
+    // ── Logout Confirm Dialog ─────────────────────────────────────────────────
+    if (showLogoutConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirm = false },
+            containerColor   = Color.White,
+            shape            = RoundedCornerShape(20.dp),
+            title = { Text("Đăng xuất?", fontWeight = FontWeight.Bold, color = Color(0xFF1A4A40)) },
+            text  = { Text("Bạn có chắc muốn đăng xuất?", color = Color(0xFF5A8A80)) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showLogoutConfirm = false
+                        auth.signOut()
+                        selectedTab = BottomTab.HOME
+                        // Sản phẩm vẫn hiển thị vì listener không phụ thuộc auth
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE57373))
+                ) { Text("Đăng xuất", color = Color.White) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirm = false }) {
+                    Text("Hủy", color = MintGreen)
+                }
+            }
+        )
+    }
+
+    // ── Scaffold ──────────────────────────────────────────────────────────────
     Scaffold(
         containerColor = BackgroundPrimary,
         topBar = {
             Column {
-                // ── Top Bar ──
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -148,7 +268,6 @@ fun ProductScreen(
                         .statusBarsPadding()
                         .padding(horizontal = 16.dp, vertical = 12.dp)
                 ) {
-                    // Logo
                     if (!showSearch) {
                         Row(
                             modifier = Modifier.align(Alignment.CenterStart),
@@ -163,29 +282,41 @@ fun ProductScreen(
                             ) { Text("🌿", fontSize = 16.sp) }
                             Spacer(Modifier.width(8.dp))
                             Column {
-                                Text("LUMIÈRE", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
-                                Text("Beauty Store", color = Color.White.copy(0.75f), fontSize = 9.sp, fontStyle = FontStyle.Italic)
+                                Text(
+                                    "LUMIÈRE",
+                                    color         = Color.White,
+                                    fontSize      = 14.sp,
+                                    fontWeight    = FontWeight.Bold,
+                                    letterSpacing = 1.5.sp
+                                )
+                                Text(
+                                    "Beauty Store",
+                                    color     = Color.White.copy(0.75f),
+                                    fontSize  = 9.sp,
+                                    fontStyle = FontStyle.Italic
+                                )
                             }
                         }
                     } else {
                         OutlinedTextField(
-                            value = searchQuery,
+                            value         = searchQuery,
                             onValueChange = { searchQuery = it },
-                            modifier = Modifier.fillMaxWidth().padding(end = 50.dp),
-                            placeholder = { Text("Tìm kiếm...", color = Color.White.copy(0.7f)) },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color.White,
+                            modifier      = Modifier
+                                .fillMaxWidth()
+                                .padding(end = 50.dp),
+                            placeholder   = { Text("Tìm kiếm...", color = Color.White.copy(0.7f)) },
+                            singleLine    = true,
+                            colors        = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor   = Color.White,
                                 unfocusedBorderColor = Color.White.copy(0.5f),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                cursorColor = Color.White
+                                focusedTextColor     = Color.White,
+                                unfocusedTextColor   = Color.White,
+                                cursorColor          = Color.White
                             ),
                             shape = RoundedCornerShape(12.dp)
                         )
                     }
 
-                    // Right icons
                     Row(
                         modifier = Modifier.align(Alignment.CenterEnd),
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -199,12 +330,14 @@ fun ProductScreen(
                                 contentDescription = null, tint = Color.White
                             )
                         }
-                        // Cart with badge
+
                         Box {
-                            IconButton(onClick = onGoCart) {
+                            IconButton(onClick = {
+                                if (isLoggedIn) onGoCart() else onGoLogin()
+                            }) {
                                 Icon(Icons.Default.ShoppingCart, contentDescription = null, tint = Color.White)
                             }
-                            if (cartCount > 0) {
+                            if (isLoggedIn && cartCount > 0) {
                                 Box(
                                     modifier = Modifier
                                         .align(Alignment.TopEnd)
@@ -221,19 +354,25 @@ fun ProductScreen(
                                 }
                             }
                         }
-                        IconButton(onClick = onLogout) {
-                            Icon(Icons.Default.Logout, contentDescription = null, tint = Color.White)
+
+                        if (isLoggedIn) {
+                            IconButton(onClick = { showAccountDialog = true }) {
+                                Icon(Icons.Default.AccountCircle, contentDescription = "Tài khoản", tint = Color.White)
+                            }
+                        } else {
+                            IconButton(onClick = onGoLogin) {
+                                Icon(Icons.Default.Login, contentDescription = "Đăng nhập", tint = Color.White)
+                            }
                         }
                     }
                 }
 
-                // ── Category chips ──
-                if (categories.size > 1) {
+                if (selectedTab == BottomTab.HOME && categories.size > 1) {
                     LazyRow(
                         modifier = Modifier
                             .background(Color.White)
                             .padding(vertical = 10.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        contentPadding        = PaddingValues(horizontal = 16.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         items(categories) { cat ->
@@ -253,8 +392,8 @@ fun ProductScreen(
                             ) {
                                 Text(
                                     cat,
-                                    color = if (isSelected) Color.White else MintGreen,
-                                    fontSize = 12.sp,
+                                    color      = if (isSelected) Color.White else MintGreen,
+                                    fontSize   = 12.sp,
                                     fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
                                 )
                             }
@@ -262,143 +401,318 @@ fun ProductScreen(
                     }
                 }
             }
+        },
+        bottomBar = {
+            NavigationBar(containerColor = Color.White, tonalElevation = 8.dp) {
+                BottomNavItem(
+                    icon     = Icons.Default.Home,
+                    label    = "Trang chủ",
+                    selected = selectedTab == BottomTab.HOME,
+                    onClick  = { selectedTab = BottomTab.HOME }
+                )
+                BottomNavItem(
+                    icon     = Icons.Default.Receipt,
+                    label    = "Đơn hàng",
+                    selected = selectedTab == BottomTab.ORDERS,
+                    onClick  = { if (isLoggedIn) selectedTab = BottomTab.ORDERS else onGoLogin() }
+                )
+                BottomNavItem(
+                    icon     = Icons.Default.Person,
+                    label    = "Tài khoản",
+                    selected = selectedTab == BottomTab.ACCOUNT,
+                    onClick  = { if (isLoggedIn) selectedTab = BottomTab.ACCOUNT else onGoLogin() }
+                )
+            }
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-        ) {
-            // ── View toggle + count ──
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "${filtered.size} sản phẩm",
-                    color = Color(0xFF8ACABA),
-                    fontSize = 13.sp
-                )
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFFEAF9F5))
-                ) {
-                    IconButton(
-                        onClick = { isGridView = true },
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (isGridView) MintGreen else Color.Transparent)
-                    ) {
-                        Icon(Icons.Default.GridView, contentDescription = null,
-                            tint = if (isGridView) Color.White else MintGreen,
-                            modifier = Modifier.size(18.dp))
-                    }
-                    IconButton(
-                        onClick = { isGridView = false },
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (!isGridView) MintGreen else Color.Transparent)
-                    ) {
-                        Icon(Icons.Default.ViewList, contentDescription = null,
-                            tint = if (!isGridView) Color.White else MintGreen,
-                            modifier = Modifier.size(18.dp))
-                    }
-                }
-            }
+        when (selectedTab) {
+            BottomTab.HOME    -> HomeTabContent(
+                padding      = padding,
+                isLoading    = isLoading,
+                filtered     = filtered,
+                isGridView   = isGridView,
+                onToggleView = { isGridView = it },
+                db           = db,
+                auth         = auth,
+                isLoggedIn   = isLoggedIn,
+                onGoLogin    = onGoLogin,
+                onGoDetail   = onGoDetail
+            )
+            BottomTab.ORDERS  -> OrdersTabContent(padding = padding)
+            BottomTab.ACCOUNT -> AccountTabContent(
+                padding  = padding,
+                auth     = auth,
+                userRole = userRole,
+                onLogout = { showLogoutConfirm = true }
+            )
+        }
+    }
+}
 
-            if (isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = MintGreen)
-                }
-            } else if (filtered.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("🔍", fontSize = 48.sp)
-                        Spacer(Modifier.height(8.dp))
-                        Text("Không tìm thấy sản phẩm", color = Color(0xFF8ACABA), fontSize = 15.sp)
-                    }
-                }
-            } else if (isGridView) {
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+// ── Bottom Nav Item ───────────────────────────────────────────────────────────
+@Composable
+private fun RowScope.BottomNavItem(
+    icon     : ImageVector,
+    label    : String,
+    selected : Boolean,
+    onClick  : () -> Unit
+) {
+    NavigationBarItem(
+        selected = selected,
+        onClick  = onClick,
+        icon     = { Icon(icon, contentDescription = label, modifier = Modifier.size(24.dp)) },
+        label    = {
+            Text(label, fontSize = 11.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+        },
+        colors = NavigationBarItemDefaults.colors(
+            selectedIconColor   = MintGreen,
+            selectedTextColor   = MintGreen,
+            unselectedIconColor = Color(0xFFAAD8CE),
+            unselectedTextColor = Color(0xFFAAD8CE),
+            indicatorColor      = Color(0xFFEAF9F5)
+        )
+    )
+}
+
+// ── HOME Tab ──────────────────────────────────────────────────────────────────
+@Composable
+private fun HomeTabContent(
+    padding      : PaddingValues,
+    isLoading    : Boolean,
+    filtered     : List<Product>,
+    isGridView   : Boolean,
+    onToggleView : (Boolean) -> Unit,
+    db           : FirebaseFirestore,
+    auth         : FirebaseAuth,
+    isLoggedIn   : Boolean,
+    onGoLogin    : () -> Unit,
+    onGoDetail   : (Product) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Row(
+            modifier              = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment     = Alignment.CenterVertically
+        ) {
+            Text("${filtered.size} sản phẩm", color = Color(0xFF8ACABA), fontSize = 13.sp)
+            Row(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(Color(0xFFEAF9F5))) {
+                IconButton(
+                    onClick  = { onToggleView(true) },
+                    modifier = Modifier.size(36.dp).clip(RoundedCornerShape(8.dp))
+                        .background(if (isGridView) MintGreen else Color.Transparent)
                 ) {
-                    items(filtered, key = { it.id }) { product ->
-                        ProductGridCard(
-                            product = product,
-                            onAddToCart = { addToCart(db, auth, it) }
-                        )
-                    }
-                    item { Spacer(Modifier.height(16.dp)) }
-                    item { Spacer(Modifier.height(16.dp)) }
+                    Icon(Icons.Default.GridView, null,
+                        tint = if (isGridView) Color.White else MintGreen, modifier = Modifier.size(18.dp))
                 }
-            } else {
-                androidx.compose.foundation.lazy.LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                IconButton(
+                    onClick  = { onToggleView(false) },
+                    modifier = Modifier.size(36.dp).clip(RoundedCornerShape(8.dp))
+                        .background(if (!isGridView) MintGreen else Color.Transparent)
                 ) {
-                    items(filtered, key = { it.id }) { product ->
-                        ProductListCard(
-                            product = product,
-                            onAddToCart = { addToCart(db, auth, it) }
-                        )
-                    }
-                    item { Spacer(Modifier.height(16.dp)) }
+                    Icon(Icons.Default.ViewList, null,
+                        tint = if (!isGridView) Color.White else MintGreen, modifier = Modifier.size(18.dp))
                 }
             }
         }
+
+        when {
+            isLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = MintGreen)
+            }
+            filtered.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("🔍", fontSize = 48.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Không tìm thấy sản phẩm", color = Color(0xFF8ACABA), fontSize = 15.sp)
+                }
+            }
+            isGridView -> LazyVerticalGrid(
+                columns               = GridCells.Fixed(2),
+                modifier              = Modifier.fillMaxSize(),
+                contentPadding        = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement   = Arrangement.spacedBy(10.dp)
+            ) {
+                items(filtered, key = { it.id }) { product ->
+                    ProductGridCard(
+                        product     = product,
+                        isLoggedIn  = isLoggedIn,
+                        onAddToCart = { if (isLoggedIn) addToCart(db, auth, it) else onGoLogin() },
+                        onCardClick = { onGoDetail(product) }
+                    )
+                }
+                item { Spacer(Modifier.height(16.dp)) }
+                item { Spacer(Modifier.height(16.dp)) }
+            }
+            else -> androidx.compose.foundation.lazy.LazyColumn(
+                modifier            = Modifier.fillMaxSize(),
+                contentPadding      = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(filtered, key = { it.id }) { product ->
+                    ProductListCard(
+                        product     = product,
+                        isLoggedIn  = isLoggedIn,
+                        onAddToCart = { if (isLoggedIn) addToCart(db, auth, it) else onGoLogin() },
+                        onCardClick = { onGoDetail(product) }
+                    )
+                }
+                item { Spacer(Modifier.height(16.dp)) }
+            }
+        }
+    }
+}
+
+// ── ORDERS Tab ────────────────────────────────────────────────────────────────
+@Composable
+private fun OrdersTabContent(padding: PaddingValues) {
+    Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("🛍️", fontSize = 56.sp)
+            Spacer(Modifier.height(12.dp))
+            Text("Đơn hàng của bạn", color = Color(0xFF1A4A40), fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(6.dp))
+            Text("Chức năng đang được phát triển", color = Color(0xFF8ACABA), fontSize = 13.sp)
+        }
+    }
+}
+
+// ── ACCOUNT Tab ───────────────────────────────────────────────────────────────
+@Composable
+private fun AccountTabContent(
+    padding  : PaddingValues,
+    auth     : FirebaseAuth,
+    userRole : String?,
+    onLogout : () -> Unit
+) {
+    val user = auth.currentUser
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(padding)
+            .padding(horizontal = 20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(Modifier.height(32.dp))
+        Box(
+            modifier = Modifier
+                .size(90.dp)
+                .clip(CircleShape)
+                .background(brush = AppGradients.mintHorizontal),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = (user?.displayName?.firstOrNull()?.toString()
+                    ?: user?.email?.firstOrNull()?.toString() ?: "U").uppercase(),
+                color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            user?.displayName ?: "Người dùng",
+            color = Color(0xFF1A4A40), fontSize = 20.sp, fontWeight = FontWeight.Bold
+        )
+        Text(user?.email ?: "", color = Color(0xFF8ACABA), fontSize = 13.sp)
+        Spacer(Modifier.height(8.dp))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(20.dp))
+                .background(if (userRole == "admin") Color(0xFFEAF9F5) else Color(0xFFF0F0F0))
+                .padding(horizontal = 14.dp, vertical = 4.dp)
+        ) {
+            Text(
+                if (userRole == "admin") "⭐ Quản trị viên" else "👤 Người dùng",
+                color      = if (userRole == "admin") MintGreen else Color(0xFF888888),
+                fontSize   = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+        Card(
+            modifier  = Modifier.fillMaxWidth(),
+            shape     = RoundedCornerShape(16.dp),
+            colors    = CardDefaults.cardColors(containerColor = Color.White),
+            elevation = CardDefaults.cardElevation(2.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    "Thông tin tài khoản",
+                    color = MintGreen, fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold, letterSpacing = 0.5.sp
+                )
+                AccountInfoRow("Họ và tên",   user?.displayName                   ?: "Chưa cập nhật")
+                HorizontalDivider(color = Color(0xFFEAF9F5), thickness = 0.5.dp)
+                AccountInfoRow("Email",        user?.email                        ?: "Chưa cập nhật")
+                HorizontalDivider(color = Color(0xFFEAF9F5), thickness = 0.5.dp)
+                AccountInfoRow("ID tài khoản", user?.uid?.take(14)?.plus("...") ?: "-")
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick  = onLogout,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape    = RoundedCornerShape(14.dp),
+            colors   = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFECEC))
+        ) {
+            Icon(Icons.Default.Logout, null, tint = Color(0xFFE57373), modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Đăng xuất", color = Color(0xFFE57373), fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+        }
+    }
+}
+
+// ── Account Info Row ──────────────────────────────────────────────────────────
+@Composable
+private fun AccountInfoRow(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = Color(0xFF8ACABA), fontSize = 13.sp)
+        Text(value, color = Color(0xFF1A4A40), fontSize = 13.sp, fontWeight = FontWeight.Medium)
     }
 }
 
 // ── Grid Card ─────────────────────────────────────────────────────────────────
 @Composable
 private fun ProductGridCard(
-    product: ProductDisplay,
-    onAddToCart: (ProductDisplay) -> Unit
+    product     : Product,
+    isLoggedIn  : Boolean,
+    onAddToCart : (Product) -> Unit,
+    onCardClick : () -> Unit
 ) {
+    val isNew = remember(product.createdAt) {
+        (System.currentTimeMillis() - product.createdAt) < 7 * 24 * 60 * 60 * 1000L
+    }
+    val isOutOfStock = product.stock == 0
+
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
+        modifier  = Modifier.fillMaxWidth().clickable { onCardClick() },
+        shape     = RoundedCornerShape(16.dp),
+        colors    = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
         Column {
-            // Image
             Box(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .height(150.dp)
+                    .fillMaxWidth().height(150.dp)
                     .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                     .background(Color(0xFFEAF9F5)),
                 contentAlignment = Alignment.Center
             ) {
                 if (product.imageUrl.isNotEmpty()) {
                     AsyncImage(
-                        model = product.imageUrl,
+                        model        = product.imageUrl,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
+                        modifier     = Modifier.fillMaxSize(),
+                        alpha        = if (isOutOfStock) 0.5f else 1f
                     )
-                } else {
-                    Text("🌿", fontSize = 40.sp)
-                }
+                } else { Text("🌿", fontSize = 40.sp) }
 
-                // NEW badge
-                if (product.isNew) {
+                if (isNew && !isOutOfStock) {
                     Box(
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(8.dp)
+                        modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
                             .clip(RoundedCornerShape(6.dp))
                             .background(brush = AppGradients.mintHorizontal)
                             .padding(horizontal = 6.dp, vertical = 2.dp)
@@ -406,13 +720,19 @@ private fun ProductGridCard(
                         Text("MỚI", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                     }
                 }
-
-                // Out of stock overlay
-                if (product.stock <= 5 && product.stock > 0) {
+                if (isOutOfStock) {
                     Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(8.dp)
+                        modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFFE0E0E0))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text("Hết hàng", color = Color(0xFF9E9E9E), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                if (product.stock in 1..5) {
+                    Box(
+                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
                             .clip(RoundedCornerShape(6.dp))
                             .background(Color(0xFFFFF3E0))
                             .padding(horizontal = 6.dp, vertical = 2.dp)
@@ -422,48 +742,43 @@ private fun ProductGridCard(
                 }
             }
 
-            // Info
             Column(modifier = Modifier.padding(10.dp)) {
                 Text(product.brandName, color = MintGreen, fontSize = 10.sp, fontWeight = FontWeight.Medium)
                 Spacer(Modifier.height(2.dp))
                 Text(
                     product.name,
-                    color = Color(0xFF1A4A40),
+                    color      = if (isOutOfStock) Color(0xFFAAAAAA) else Color(0xFF1A4A40),
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 13.sp,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
+                    fontSize   = 13.sp,
+                    maxLines   = 2,
+                    overflow   = TextOverflow.Ellipsis
                 )
                 Spacer(Modifier.height(6.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier              = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment     = Alignment.CenterVertically
                 ) {
-                    Column {
-                        Text(
-                            "${"%,.0f".format(product.price)}đ",
-                            color = Color(0xFF1A4A40),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                        if (product.originalPrice > product.price) {
-                            Text(
-                                "${"%,.0f".format(product.originalPrice)}đ",
-                                color = Color(0xFFAAD8CE),
-                                fontSize = 10.sp,
-                                textDecoration = TextDecoration.LineThrough
+                    Text(
+                        "${"%,.0f".format(product.price)}đ",
+                        color      = if (isOutOfStock) Color(0xFFAAAAAA) else Color(0xFF1A4A40),
+                        fontWeight = FontWeight.Bold,
+                        fontSize   = 13.sp
+                    )
+                    if (!isOutOfStock) {
+                        IconButton(
+                            onClick  = { onAddToCart(product) },
+                            modifier = Modifier.size(32.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(brush = AppGradients.mintHorizontal)
+                        ) {
+                            Icon(
+                                if (isLoggedIn) Icons.Default.Add else Icons.Default.Login,
+                                contentDescription = null,
+                                tint     = Color.White,
+                                modifier = Modifier.size(16.dp)
                             )
                         }
-                    }
-                    IconButton(
-                        onClick = { onAddToCart(product) },
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(brush = AppGradients.mintHorizontal)
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "Thêm vào giỏ", tint = Color.White, modifier = Modifier.size(16.dp))
                     }
                 }
             }
@@ -474,19 +789,23 @@ private fun ProductGridCard(
 // ── List Card ─────────────────────────────────────────────────────────────────
 @Composable
 private fun ProductListCard(
-    product: ProductDisplay,
-    onAddToCart: (ProductDisplay) -> Unit
+    product     : Product,
+    isLoggedIn  : Boolean,
+    onAddToCart : (Product) -> Unit,
+    onCardClick : () -> Unit
 ) {
+    val isNew = remember(product.createdAt) {
+        (System.currentTimeMillis() - product.createdAt) < 7 * 24 * 60 * 60 * 1000L
+    }
+    val isOutOfStock = product.stock == 0
+
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
+        modifier  = Modifier.fillMaxWidth().clickable { onCardClick() },
+        shape     = RoundedCornerShape(16.dp),
+        colors    = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
                     .size(80.dp)
@@ -496,23 +815,32 @@ private fun ProductListCard(
             ) {
                 if (product.imageUrl.isNotEmpty()) {
                     AsyncImage(
-                        model = product.imageUrl,
+                        model        = product.imageUrl,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp))
+                        modifier     = Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp)),
+                        alpha        = if (isOutOfStock) 0.5f else 1f
                     )
-                } else {
-                    Text("🌿", fontSize = 32.sp)
-                }
-                if (product.isNew) {
+                } else { Text("🌿", fontSize = 32.sp) }
+
+                if (isNew && !isOutOfStock) {
                     Box(
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
+                        modifier = Modifier.align(Alignment.TopStart)
                             .clip(RoundedCornerShape(bottomEnd = 6.dp))
                             .background(brush = AppGradients.mintHorizontal)
                             .padding(horizontal = 4.dp, vertical = 2.dp)
                     ) {
                         Text("MỚI", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                if (isOutOfStock) {
+                    Box(
+                        modifier = Modifier.align(Alignment.TopStart)
+                            .clip(RoundedCornerShape(bottomEnd = 6.dp))
+                            .background(Color(0xFFE0E0E0))
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    ) {
+                        Text("Hết hàng", color = Color(0xFF9E9E9E), fontSize = 8.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -523,57 +851,48 @@ private fun ProductListCard(
                 Text(product.brandName, color = MintGreen, fontSize = 10.sp)
                 Text(
                     product.name,
-                    color = Color(0xFF1A4A40),
+                    color      = if (isOutOfStock) Color(0xFFAAAAAA) else Color(0xFF1A4A40),
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 14.sp,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
+                    fontSize   = 14.sp,
+                    maxLines   = 2,
+                    overflow   = TextOverflow.Ellipsis
                 )
                 if (product.category.isNotEmpty()) {
                     Spacer(Modifier.height(2.dp))
                     Text(product.category, color = Color(0xFFAAD8CE), fontSize = 11.sp)
                 }
                 Spacer(Modifier.height(6.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "${"%,.0f".format(product.price)}đ",
-                        color = Color(0xFF1A4A40),
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp
-                    )
-                    if (product.originalPrice > product.price) {
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "${"%,.0f".format(product.originalPrice)}đ",
-                            color = Color(0xFFAAD8CE),
-                            fontSize = 11.sp,
-                            textDecoration = TextDecoration.LineThrough
-                        )
-                    }
-                }
+                Text(
+                    "${"%,.0f".format(product.price)}đ",
+                    color      = if (isOutOfStock) Color(0xFFAAAAAA) else Color(0xFF1A4A40),
+                    fontWeight = FontWeight.Bold,
+                    fontSize   = 14.sp
+                )
             }
 
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(brush = AppGradients.mintHorizontal)
-                    .clickable { onAddToCart(product) },
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(Icons.Default.ShoppingCartCheckout, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+            if (!isOutOfStock) {
+                Box(
+                    modifier = Modifier.size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(brush = AppGradients.mintHorizontal)
+                        .clickable { onAddToCart(product) },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        if (isLoggedIn) Icons.Default.ShoppingCartCheckout else Icons.Default.Login,
+                        contentDescription = null,
+                        tint     = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
             }
         }
     }
 }
 
-// ── Add to cart ───────────────────────────────────────────────────────────────
-private fun addToCart(
-    db: FirebaseFirestore,
-    auth: FirebaseAuth,
-    product: ProductDisplay
-) {
-    val uid = auth.currentUser?.uid ?: return
+// ── Add to Cart ───────────────────────────────────────────────────────────────
+private fun addToCart(db: FirebaseFirestore, auth: FirebaseAuth, product: Product) {
+    val uid     = auth.currentUser?.uid ?: return
     val cartRef = db.collection("carts").document(uid)
         .collection("items").document(product.id)
 
@@ -581,15 +900,14 @@ private fun addToCart(
         val snap = transaction.get(cartRef)
         val qty  = (snap.getLong("quantity") ?: 0L).toInt()
         transaction.set(
-            cartRef,
-            hashMapOf(
-                "productId"   to product.id,
-                "name"        to product.name,
-                "price"       to product.price,
-                "imageUrl"    to product.imageUrl,
-                "brandName"   to product.brandName,
-                "quantity"    to qty + 1,
-                "updatedAt"   to System.currentTimeMillis()
+            cartRef, hashMapOf(
+                "productId" to product.id,
+                "name"      to product.name,
+                "price"     to product.price,
+                "imageUrl"  to product.imageUrl,
+                "brandName" to product.brandName,
+                "quantity"  to qty + 1,
+                "updatedAt" to System.currentTimeMillis()
             )
         )
     }
